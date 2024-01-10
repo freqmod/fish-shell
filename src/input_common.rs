@@ -136,6 +136,7 @@ pub enum ReadlineCmd {
     RepeatJump,
     ClearScreenAndRepaint,
     ScrollbackPush,
+    MoveJumpAnchor,
     // NOTE: This one has to be last.
     ReverseRepeatJump,
 }

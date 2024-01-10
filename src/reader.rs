@@ -638,6 +638,8 @@ pub struct ReaderData {
     in_flight_autosuggest_request: WString,
 
     rls: Option<ReadlineLoopState>,
+
+    move_locations_displayed: bool,
 }
 
 /// Reader is ReaderData equippeed with a Parser, so it can execute fish script.
@@ -1253,6 +1255,7 @@ impl ReaderData {
             in_flight_highlight_request: Default::default(),
             in_flight_autosuggest_request: Default::default(),
             rls: None,
+            move_locations_displayed: Default::default(),
         }))
     }
 
@@ -1536,6 +1539,72 @@ pub fn combine_command_and_autosuggestion(
         + &cmdline[pos..]
 }
 
+fn line_move_locations_inner<F, I>(
+    base: &wstr,
+    char_iter: I,
+    jump_anchors: &wstr,
+    mut record_location: F,
+) where
+    F: FnMut(usize, char),
+    I: Iterator<Item = char>,
+{
+    let mut alphanumeric_state = base.char_at(0).is_alphanumeric();
+    let mut anchor_idx = 0;
+    let mut jump_before_iter = jump_anchors.chars();
+    let mut last_location: Option<usize> = None;
+    for (cidx, char) in char_iter.enumerate() {
+        if char.is_alphanumeric() != alphanumeric_state {
+            alphanumeric_state = char.is_alphanumeric();
+            //log::info!("State change x:{}", cidx);
+            /* Skip adjacent locations, is there a way to do this without
+            being unstable when moving the cursor */
+            if last_location
+                .map(|ll| cidx.saturating_sub(ll) > 1)
+                .unwrap_or(true)
+                && cidx > 0
+            {
+                /* Show jump anchor at every transition between alphanumeric an non alphanumeric text */
+                if jump_anchors.len() > anchor_idx {
+                    if let Some(jump_anchor) = jump_before_iter.next() {
+                        last_location = Some(cidx);
+                        // render char instead
+                        record_location(cidx, jump_anchor);
+                        anchor_idx += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+pub fn line_move_locations<F>(
+    base: &wstr,
+    jump_anchors: &wstr,
+    cursor: usize,
+    after: bool,
+    record_location: F,
+) where
+    F: FnMut(usize, char),
+{
+    if jump_anchors.is_empty() {
+        return;
+    }
+    /* TODO: Ideally we should use grapheme based iteration.
+    Currently only unicode codepoint based iteration is used */
+    /*let (before_cursor, after_cursor) =
+    base.split_at((cursor + if after { 0 } else { 1 }).min(base.len()));*/
+    if after {
+        if cursor < base.len() {
+            let after_cursor = &base[cursor..];
+            let char_iter = after_cursor.chars();
+            line_move_locations_inner(base, char_iter, jump_anchors, record_location)
+        }
+    } else {
+        let before_cursor = &base[0..(cursor + 1).min(base.len())];
+        let char_iter = before_cursor.chars().rev();
+        line_move_locations_inner(base, char_iter, jump_anchors, record_location)
+    };
+}
+
 impl<'a> Reader<'a> {
     pub(crate) fn blocking_query(&self) -> RefMut<'_, Option<TerminalQuery>> {
         self.parser.blocking_query.get().unwrap().borrow_mut()
@@ -1639,6 +1708,107 @@ impl<'a> Reader<'a> {
         self.paint_layout(L!("prepare to execute"), true);
     }
 
+    pub fn reader_set_show_overlay_state(&mut self, visible: bool) {
+        if let Some(data) = current_data() {
+            data.move_locations_displayed = visible;
+            self.layout_and_repaint(L!(" readline show move jump anchor"));
+        }
+    }
+
+    fn move_location_perfom(&mut self, target: char, elt: EditableLineTag) {
+        let jump_anchors_before = self
+            .vars()
+            .get(L!("fish_jump_anchors_before"))
+            .map(|ev| ev.as_string())
+            .unwrap_or_default();
+        let jump_anchors_after = self
+            .vars()
+            .get(L!("fish_jump_anchors_after"))
+            .map(|ev| ev.as_string())
+            .unwrap_or_default();
+
+        let basis_text = self.command_line.text();
+        let current_position = self.command_line.position();
+
+        let mut target_pos = None;
+        // TODO: Adjust target pos depending on if to or till mode is enabled
+        if jump_anchors_before.contains(target) {
+            line_move_locations(
+                &basis_text,
+                &jump_anchors_before,
+                current_position,
+                false,
+                |pos, jump_char| {
+                    let abs_pos = current_position.saturating_sub(pos);
+                    if jump_char == target {
+                        target_pos = Some(abs_pos);
+                    }
+                },
+            );
+        } else if jump_anchors_after.contains(target) {
+            line_move_locations(
+                &basis_text,
+                &jump_anchors_after,
+                current_position,
+                true,
+                |pos, jump_char| {
+                    let abs_pos = current_position + pos;
+                    if jump_char == target {
+                        target_pos = Some(abs_pos);
+                    }
+                },
+            );
+        } else {
+            /* Target character not found, do nothing */
+        }
+        if let Some(target_pos) = target_pos {
+            self.update_buff_pos(elt, Some(target_pos));
+        }
+        self.move_locations_displayed = false;
+    }
+    fn apply_overlays(&self, basis: WString, highlight: &mut Vec<HighlightSpec>) -> WString {
+        let current_position = self.command_line.position();
+        // TODO: Figure out a way to do string manipulation in an unicode safe manner
+        let mut overlayed = basis.clone().into_vec();
+        let jump_anchors_before = self
+            .vars()
+            .get(L!("fish_jump_anchors_before"))
+            .map(|ev| ev.as_string())
+            .unwrap_or_default();
+        let jump_anchors_after = self
+            .vars()
+            .get(L!("fish_jump_anchors_after"))
+            .map(|ev| ev.as_string())
+            .unwrap_or_default();
+        line_move_locations(
+            &basis,
+            &jump_anchors_before,
+            current_position,
+            false,
+            |pos, jump_char| {
+                let abs_pos = current_position.saturating_sub(pos);
+                overlayed.get_mut(abs_pos).map(|c| *c = jump_char as u32);
+                highlight
+                    .get_mut(abs_pos)
+                    .map(|h| h.background = HighlightRole::search_match);
+            },
+        );
+        line_move_locations(
+            &basis,
+            &jump_anchors_after,
+            current_position,
+            true,
+            |pos, jump_char| {
+                let abs_pos = current_position + pos;
+                overlayed.get_mut(abs_pos).map(|c| *c = jump_char as u32);
+                highlight
+                    .get_mut(abs_pos)
+                    .map(|h| h.background = HighlightRole::search_match);
+            },
+        );
+        WString::from_vec(overlayed).unwrap()
+    }
+
     /// Paint the last rendered layout.
     /// `reason` is used in FLOG to explain why.
     fn paint_layout(&mut self, reason: &wstr, is_final_rendering: bool) {
@@ -1650,6 +1820,16 @@ impl<'a> Reader<'a> {
                 Cow::Owned(
                     wstr::from_char_slice(&[get_obfuscation_read_char()]).repeat(cmd_line.len()),
                 ),
+                None,
+            )
+        } else if self.move_locations_displayed {
+            let mut command_line_string = WString::new();
+            let data = &self.data.rendered_layout;
+            command_line_string.push_utfstr(cmd_line.text());
+            let mut colors = data.colors.clone();
+            // Combine the command and autosuggestion into one string.
+            (
+                Cow::Owned(self.apply_overlays(command_line_string, &mut colors)),
                 None,
             )
         } else if self.is_at_line_with_autosuggestion() {
@@ -3858,6 +4038,13 @@ impl<'a> Reader<'a> {
                 self.last_jump_direction = original_dir;
 
                 self.input_data.function_set_status(success);
+            }
+            rl::MoveJumpAnchor => {
+                if let Some(target) = self.function_pop_arg() {
+                    self.move_locations_displayed = false;
+                    let (elt, _el) = self.active_edit_line();
+                    self.move_location_perfom(target, elt);
+                }
             }
             rl::ExpandAbbr => {
                 if self.expand_abbreviation_at_cursor(1) {
